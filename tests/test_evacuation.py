@@ -185,6 +185,142 @@ def test_capacity_contention_on_shared_downstream_corridor(env):
     assert by_id["b"]["completion_offset_seconds"] == 10
 
 
+def test_capacity_staggered_under_saturation_enters_immediately(env):
+    """错峰未饱和：与窗口重叠的占用条数达到容量，但任一时刻实际并发未满。
+
+    通道容量 3、通行 10；三件已编排展品分别 1、10、19 进入，占用
+    [1,11)、[10,20)、[19,29)。新展品经 10 秒支路在 10 到达瓶颈，窗口
+    [10,20) 与全部三条占用半开重叠（旧实现按重叠条数 3 >= 容量 3 误判，
+    推迟到 11）；但窗口内任一时刻实际并发最多为 2（10-11 与 19-20），
+    容量未满，正确结果是 10 整点立即进入。
+    """
+    client, _ = env
+    for eid in ("a", "b", "c", "x"):
+        make_exhibit(client, eid)
+    # 远端支路让 a/b/c/x 分别在 1、10、19、10 到达瓶颈 P->B
+    b = body(
+        [
+            ex("a", "F1", 4), ex("b", "F2", 3), ex("c", "F3", 2),
+            ex("x", "Fx", 1),
+        ],
+        nodes=["F1", "F2", "F3", "Fx", "P", "B"],
+        edges=[
+            edge("F1", "P", 1), edge("F2", "P", 10), edge("F3", "P", 19),
+            edge("Fx", "P", 10), edge("P", "B", 10, 3),
+        ],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    by_id = {r["canonical_id"]: r for r in out["results"]}
+    assert by_id["a"]["legs"][1]["enter_offset_seconds"] == 1
+    assert by_id["b"]["legs"][1]["enter_offset_seconds"] == 10
+    assert by_id["c"]["legs"][1]["enter_offset_seconds"] == 19
+    # 新展品 10 到达 P：重叠占用有 3 条，但实际瞬时并发峰值仅 2，不等待
+    assert by_id["x"]["legs"][1]["enter_offset_seconds"] == 10
+    assert by_id["x"]["legs"][1]["wait_seconds"] == 0
+    assert by_id["x"]["completion_offset_seconds"] == 20
+
+
+def test_capacity_true_saturation_waits_for_actual_release(env):
+    """真实饱和：同一时刻确有 capacity 件占用时必须等待，修复不得矫枉过正。
+
+    通道容量 3、通行 10；三件展品分别在 0、2、4 进入瓶颈，在 [4,10)
+    瞬时并发为 3。第四件经 4 秒支路在 4 到达，加入后峰值将达到 4 →
+    必须等待；最早释放发生在 10（[0,10) 离开，半开整点不计并发），
+    10 进入后峰值为 2，立即放行。若实现错把容量口径放宽成只看
+    “重叠条数以外”的计数，此处会误放行。
+    """
+    client, _ = env
+    for eid in ("a", "b", "c", "x"):
+        make_exhibit(client, eid)
+    # 让 a/b/c 的瓶颈段分别在 0、2、4 进入 P->B（容量 3、通行 10）
+    b = body(
+        [
+            ex("a", "P", 4), ex("b", "F2", 3), ex("c", "F3", 2),
+            ex("x", "Fx", 1),
+        ],
+        nodes=["F2", "F3", "Fx", "P", "B"],
+        edges=[
+            edge("F2", "P", 2), edge("F3", "P", 4), edge("Fx", "P", 4),
+            edge("P", "B", 10, 3),
+        ],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    by_id = {r["canonical_id"]: r for r in out["results"]}
+    assert by_id["a"]["legs"][0]["enter_offset_seconds"] == 0
+    assert by_id["b"]["legs"][1]["enter_offset_seconds"] == 2
+    assert by_id["c"]["legs"][1]["enter_offset_seconds"] == 4
+    assert by_id["x"]["legs"][1]["enter_offset_seconds"] == 10
+    assert by_id["x"]["legs"][1]["wait_seconds"] == 6
+    assert by_id["x"]["completion_offset_seconds"] == 20
+
+
+def test_capacity_half_open_exact_release_under_staggered_load(env):
+    """恰好释放：候选整点恰有一条占用离开，瞬时并发降到容量以下即放行。
+
+    容量 2、通行 10：瓶颈已占用 [0,10) 与 [5,15)。新展品经 10 秒支路
+    在 10 到达瓶颈，[0,10) 在 10 整点恰好离开（半开不计），窗口
+    [10,20) 内只剩 [5,15) 一条占用（15 之后为 0），峰值 1 < 2，
+    应 10 立即进入。
+    """
+    client, _ = env
+    for eid in ("a", "b", "x"):
+        make_exhibit(client, eid)
+    b = body(
+        [ex("a", "P", 3), ex("b", "F", 2), ex("x", "Fx", 1)],
+        nodes=["F", "Fx", "P", "B"],
+        edges=[edge("F", "P", 5), edge("Fx", "P", 10), edge("P", "B", 10, 2)],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    by_id = {r["canonical_id"]: r for r in out["results"]}
+    assert by_id["a"]["legs"][0]["enter_offset_seconds"] == 0
+    assert by_id["b"]["legs"][1]["enter_offset_seconds"] == 5
+    assert by_id["x"]["legs"][1]["enter_offset_seconds"] == 10
+    assert by_id["x"]["legs"][1]["wait_seconds"] == 0
+    assert by_id["x"]["completion_offset_seconds"] == 20
+
+
+def test_capacity_then_closure_then_capacity_consecutive_blocking(env):
+    """容量与封闭连续阻塞：每次推进后重新检查两类约束，不跳过更早空档。
+
+    瓶颈 A->B 容量 1、通行 4、封闭 [6,10)。四件高优先级展品依次占用
+    [0,4)、[4,8)（跨越封闭允许）、[10,14)、[14,18)；新展品 0 到达：
+      - t=0 容量满 → 推到 4；4 仍被 [4,8) 占用 → 推到 8；
+      - t=8 落在封闭 [6,10) → 推到 10；
+      - t=10 又被 [10,14) 占用 → 推到 14；14 被 [14,18) 占用 → 推到 18；
+      - 18 时刻两类约束都满足，进入，22 完成。
+    中途 8、10、14 每个候选都必须在推进后重新同时检查容量与封闭。
+    """
+    client, _ = env
+    for i in range(5):
+        make_exhibit(client, f"p{i}")
+    b = body(
+        [ex(f"p{i}", "A", 10 - i) for i in range(4)] + [ex("p4", "A", 0)],
+        nodes=["A", "B"],
+        edges=[edge("A", "B", 4, 1, closures=[[6, 10]])],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    rows = {
+        r["canonical_id"]: (
+            r["legs"][0]["enter_offset_seconds"],
+            r["legs"][0]["wait_seconds"],
+            r["completion_offset_seconds"],
+        )
+        for r in out["results"]
+    }
+    assert rows == {
+        "p0": (0, 0, 4),
+        "p1": (4, 4, 8),
+        "p2": (10, 10, 14),
+        "p3": (14, 14, 18),
+        "p4": (18, 18, 22),
+    }
+    assert out["total_completion_offset_seconds"] == 22
+
+
 # ---------- 半开封闭时段：等待与绕行 ----------
 
 def test_closure_waits_to_exact_end_when_no_detour(env):

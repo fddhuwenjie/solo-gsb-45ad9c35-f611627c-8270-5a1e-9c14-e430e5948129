@@ -24,7 +24,10 @@
 等待规则
 --------
 到达某通道起点后若不能立即进入，则等待到**首个可行进入时刻**：
-既要避开全部已占用通道的区间（容量未满），也要避开封闭时段。
+容量按候选窗口内**同一时刻的实际并发**判断（只有加入本件会使某一瞬间
+达到容量才等待；多条占用错峰、重叠条数虽多但瞬时并发未满时不等待），
+并避开封闭时段；每次因容量或封闭推进候选时刻后都重新检查两类约束，
+不会跳过更早的可行空档。
 """
 from __future__ import annotations
 
@@ -135,31 +138,50 @@ class CorridorState:
 
         候选进入时刻 ``t ≥ ready`` 必须同时满足：
 
-        1. **容量**：区间 ``[t, t+travel)`` 内同时在通道内的已编排展品数
-           小于容量。占用按半开区间计数，恰好在 ``t`` 离开的区间不计数；
+        1. **容量**：加入本件占用 ``[t, t+travel)`` 后，窗口内**任一时刻**
+           同时在通道内的已编排展品数（实际瞬时并发）小于容量。容量按
+           **同一时刻的实际并发**计数，而不是按与本窗口重叠的占用条数：
+           多条占用彼此错峰时，重叠条数可能超过容量、瞬时并发却未满，
+           此时仍应允许进入。占用按半开区间计数，恰好在 ``t`` 离开的区间
+           不计数，在 ``t+travel`` 进入的区间也不计数；
         2. **封闭**：``t`` 不落在任何封闭半开区间 ``[cs, ce)`` 内
            （``t == ce`` 可以进入；进入后跨过封闭开始时刻允许）。
 
         不可行时把 ``t`` 推进到“挡住它的最早约束的下一可行时刻”：
-        容量冲突 → 与之重叠的占用区间中最早的离开时刻；
-        封闭冲突 → 该封闭时段结束时刻。两个候选取较晚者。
-        每次推进都越过至少一个有限右端点，故迭代必然终止。
+        容量冲突 → 与窗口重叠的占用区间中最早的离开时刻（窗口内造成饱和
+        的那批占用在此时刻之前全部仍未离开，故其间不存在可行整数时刻，
+        推进不会跳过更早空档）；封闭冲突 → 该封闭时段结束时刻。两个候选
+        取较晚者。每次推进都越过至少一个有限右端点，故迭代必然终止。
         """
         t = ready
         travel = self.edge.travel
         while True:
             leave = t + travel
-            # 与 [t, t+travel) 半开重叠的已占用区间：
-            # 占用在 t 整点已离开（e == t）不计；下一件在 leave 整点进入
-            # （s == leave）也不计。
-            overlapping = [
-                (s, e) for s, e in self.occupied if s < leave and e > t
-            ]
+            # 扫描线求窗口 [t, leave) 内的实际瞬时并发峰值：
+            # 与 [t, leave) 半开重叠的占用先裁剪到窗口内，再在每个区间
+            # 起点 +1、终点 -1；占用在 t 整点已离开（e == t）不计，下一件
+            # 在 leave 整点进入（s == leave）也不计。
+            events: dict[int, int] = {}
+            earliest_release: int | None = None
+            for s, e in self.occupied:
+                if s < leave and e > t:
+                    if earliest_release is None or e < earliest_release:
+                        earliest_release = e
+                    events[max(s, t)] = events.get(max(s, t), 0) + 1
+                    events[min(e, leave)] = events.get(min(e, leave), 0) - 1
+
             next_t: int | None = None
-            if len(overlapping) >= self.edge.capacity:
-                # 最早一条冲突区间释放之前计数不会下降（其间没有区间结束），
-                # 故至少要等到最早的离开时刻。
-                next_t = min(e for _s, e in overlapping)
+            if events:
+                concurrent = 0
+                peak = 0
+                for ts in sorted(events):
+                    concurrent += events[ts]
+                    if concurrent > peak:
+                        peak = concurrent
+                if peak >= self.edge.capacity:
+                    # 最早一条重叠占用离开之前，造成饱和的那批占用无一释放，
+                    # 峰值不会降到容量以下，故至少要等到最早的离开时刻。
+                    next_t = earliest_release
 
             # 封闭检查：进入时刻不得落在 [cs, ce) 内
             for cs, ce in self.edge.closures:
