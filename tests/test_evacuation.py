@@ -185,6 +185,140 @@ def test_capacity_contention_on_shared_downstream_corridor(env):
     assert by_id["b"]["completion_offset_seconds"] == 10
 
 
+# ---------- 容量口径：按同一时刻实际并发（错峰未饱和 / 真实饱和 / 恰好释放） ----------
+
+def test_staggered_occupancy_never_saturating_does_not_wait(env):
+    """错峰未饱和：容量 3 的通道已有 [1,11)、[10,20)、[19,29) 三件占用。
+
+    任一时刻旧占用最多 2 件（[1,11) 与 [10,20) 仅在 10 整点并发；
+    [10,20) 与 [19,29) 仅在 19 整点并发）。新展品 10 秒到达、通行 10 秒，
+    新窗口 [10,20) 虽然与全部三件旧占用都“沾边”，但加入后没有任何时刻
+    并发超过 3，必须 10 秒整进入（旧实现按“重叠区间条数”误判为满，
+    错误推迟到 11）。
+    """
+    client, _ = env
+    for eid in ("e1", "e2", "e3", "x"):
+        make_exhibit(client, eid)
+    # 三条独立馈入边让前三件分别在 1 / 10 / 19 到达 A；x 经 10s 馈入边 10 秒到 A；
+    # 馈入边互不争用（独立有向通道），容量竞争只发生在 A->B
+    b = body(
+        [ex("e1", "S1", 3), ex("e2", "S2", 2), ex("e3", "S3", 1), ex("x", "X", 0)],
+        nodes=["S1", "S2", "S3", "X", "A", "B"],
+        edges=[
+            edge("S1", "A", 1, 3), edge("S2", "A", 10, 3),
+            edge("S3", "A", 19, 3), edge("X", "A", 10, 1),
+            edge("A", "B", 10, 3),
+        ],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    by_id = {r["canonical_id"]: r for r in out["results"]}
+    assert [(lg["enter_offset_seconds"], lg["leave_offset_seconds"])
+            for lg in by_id["e1"]["legs"] if lg["from"] == "A"] == [(1, 11)]
+    assert [(lg["enter_offset_seconds"], lg["leave_offset_seconds"])
+            for lg in by_id["e2"]["legs"] if lg["from"] == "A"] == [(10, 20)]
+    assert [(lg["enter_offset_seconds"], lg["leave_offset_seconds"])
+            for lg in by_id["e3"]["legs"] if lg["from"] == "A"] == [(19, 29)]
+    xleg = [lg for lg in by_id["x"]["legs"] if lg["from"] == "A"][0]
+    assert xleg["enter_offset_seconds"] == 10
+    assert xleg["wait_seconds"] == 0
+    assert by_id["x"]["completion_offset_seconds"] == 20
+    assert out["total_completion_offset_seconds"] == 29
+
+
+def test_true_saturation_within_new_window_forces_wait_to_release(env):
+    """真实饱和：容量 2，旧占用 [0,10) 与 [5,15) 在 [5,10) 真有 2 件并发。
+
+    新展品 0 时刻到达、通行 10 秒，新窗口 [0,10) 覆盖饱和段 [5,10)，
+    加入即 3 件并发，必须等到首个释放时刻 10（不是等到全部重叠区间结束 15）。
+    """
+    client, _ = env
+    for eid in ("e1", "e2", "x"):
+        make_exhibit(client, eid)
+    # e1 直接在 A：0 进入 [0,10)；e2 经 5s 馈入：5 进入 [5,15)
+    b = body(
+        [ex("e1", "A", 2), ex("e2", "S", 1), ex("x", "A", 0)],
+        nodes=["S", "A", "B"],
+        edges=[edge("S", "A", 5, 2), edge("A", "B", 10, 2)],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    by_id = {r["canonical_id"]: r for r in out["results"]}
+    (xleg,) = by_id["x"]["legs"]
+    assert xleg["enter_offset_seconds"] == 10
+    assert xleg["wait_seconds"] == 10
+    assert by_id["x"]["completion_offset_seconds"] == 20
+
+
+def test_entry_at_exact_release_when_saturated_pair_drops_at_boundary(env):
+    """恰好释放：容量 2，旧占用 [0,10)、[5,15)、[15,25)（后两段半开首尾相接，
+    15 整点不并发；真正的饱和段只有 [5,10)）。新展品恰好在 10 秒（饱和对中
+    [0,10) 离开的整点）到达，新窗口 [10,20) 与 [5,15)、[15,25) 都“沾边”，
+    但任一时刻最多再叠 1 件旧占用：[10,15) 只有 [5,15)、[15,20) 只有
+    [15,25)。半开边界下必须 10 整进入，不得按重叠条数推迟到 15。
+    """
+    client, _ = env
+    for eid in ("e1", "e2", "e3", "x"):
+        make_exhibit(client, eid)
+    b = body(
+        [ex("e1", "A", 3), ex("e2", "S5", 2), ex("e3", "S15", 1), ex("x", "X", 0)],
+        nodes=["S5", "S15", "X", "A", "B"],
+        edges=[
+            edge("S5", "A", 5, 1), edge("S15", "A", 15, 1), edge("X", "A", 10, 1),
+            edge("A", "B", 10, 2),
+        ],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    by_id = {r["canonical_id"]: r for r in out["results"]}
+    committed = [
+        (r["canonical_id"],
+         [(lg["enter_offset_seconds"], lg["leave_offset_seconds"])
+          for lg in r["legs"] if lg["from"] == "A"][0])
+        for r in out["results"]
+    ]
+    assert ("e1", (0, 10)) in committed
+    assert ("e2", (5, 15)) in committed
+    assert ("e3", (15, 25)) in committed
+    x_ab = [lg for lg in by_id["x"]["legs"] if lg["from"] == "A"][0]
+    assert x_ab["enter_offset_seconds"] == 10
+    assert x_ab["wait_seconds"] == 0
+    assert by_id["x"]["completion_offset_seconds"] == 20
+    assert out["total_completion_offset_seconds"] == 25
+
+
+def test_capacity_push_into_closure_then_wait_through_closure_end(env):
+    """容量与封闭连续阻塞：容量先把候选时刻推进封闭段内，必须再越过封闭结束。
+
+    通道 A->B 通行 5、容量 1、封闭 [10,15)；旧占用 [5,10)（旧件经 5s 馈入）。
+    新展品 5 秒到达 A：容量阻塞窗口 [1,10) 与封闭 [10,15) 首尾相接合并为
+    [1,15)，候选 5 → 10（恰被封闭挡住）→ 15，首个可行时刻是 15，
+    不能停在 10、也不能跳过更早的空档（5 之前不可达，5..10 被容量占满）。
+    """
+    client, _ = env
+    make_exhibit(client, "e")
+    make_exhibit(client, "x")
+    b = body(
+        [ex("e", "S", 1), ex("x", "X", 0)],
+        nodes=["S", "X", "A", "B"],
+        edges=[
+            edge("S", "A", 5, 1), edge("X", "A", 5, 1),
+            edge("A", "B", 5, 1, closures=[[10, 15]]),
+        ],
+        exits=["B"],
+    )
+    out = plan(client, b)
+    by_id = {r["canonical_id"]: r for r in out["results"]}
+    # 旧件 5 进入、[5,10)，进入时封闭尚未开始（跨越允许）
+    assert by_id["e"]["legs"][1]["enter_offset_seconds"] == 5
+    legs_x = {(lg["from"], lg["to"]): lg for lg in by_id["x"]["legs"]}
+    assert (legs_x[("A", "B")]["enter_offset_seconds"] == 15)
+    assert (legs_x[("A", "B")]["wait_seconds"] == 10)
+    assert by_id["x"]["completion_offset_seconds"] == 20
+    assert by_id["x"]["wait_seconds"] == 10
+    assert out["total_completion_offset_seconds"] == 20
+
+
 # ---------- 半开封闭时段：等待与绕行 ----------
 
 def test_closure_waits_to_exact_end_when_no_detour(env):

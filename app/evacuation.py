@@ -24,7 +24,9 @@
 等待规则
 --------
 到达某通道起点后若不能立即进入，则等待到**首个可行进入时刻**：
-既要避开全部已占用通道的区间（容量未满），也要避开封闭时段。
+容量按同一时刻的实际并发计数（加入本件后任一时刻并发不超过容量），
+且进入时刻不落在封闭时段内；两类阻塞统一展开为进入时刻时间线上的
+半开区间，逐段重检，不跳过更早空档。
 """
 from __future__ import annotations
 
@@ -129,56 +131,103 @@ class CorridorState:
     edge: Edge
     # 已确定编排展品的占用区间 [enter, leave)，按进入时刻排序
     occupied: list[tuple[int, int]] = field(default_factory=list)
+    # saturated_regions 的缓存：占用只在 commit 时追加，故 commit 时置空失效
+    _saturated: list[tuple[int, int]] | None = field(default=None, repr=False)
+
+    def saturated_regions(self) -> list[tuple[int, int]]:
+        """已占用区间在时间线上达到容量的饱和时段（半开、合并后）。
+
+        容量按**同一时刻的实际并发**计数：用 (+1 起点 / -1 终点) 事件做
+        扫描线，同一时刻先处理离开（-1）再处理进入（+1），恰好体现
+        半开语义——恰好在某整点离开的占用不计入该整点的并发。扫描中
+        并发数达到容量的时段即为饱和时段，首尾相接/重叠的时段合并。
+        """
+        if self._saturated is not None:
+            return self._saturated
+
+        capacity = self.edge.capacity
+        events: list[tuple[int, int]] = []
+        for s, e in self.occupied:
+            events.append((s, +1))
+            events.append((e, -1))
+        # 同一时刻 -1（离开）排在 +1（进入）之前：离开整点不计并发
+        events.sort(key=lambda x: (x[0], x[1]))
+
+        saturated: list[tuple[int, int]] = []
+        active = 0
+        seg_start: int | None = None
+        prev_t: int | None = None
+        for t, delta in events:
+            if seg_start is not None and prev_t is not None and prev_t < t:
+                saturated.append((seg_start, t))
+                seg_start = None
+            active += delta
+            prev_t = t
+            if active >= capacity:
+                if seg_start is None:
+                    seg_start = t
+            else:
+                seg_start = None
+        # active 最终必为 0，故无需收尾
+        self._saturated = saturated
+        return saturated
+
+    def blocked_entry_intervals(self) -> list[tuple[int, int]]:
+        """使候选进入时刻不可行的全部半开时段（容量阻塞 ∪ 封闭，已合并）。
+
+        两类阻塞都展开到“候选进入时刻 ``t``”这一条时间线上：
+
+        - **容量阻塞**：新占用 ``[t, t+travel)`` 与某饱和时段 ``[s, e)``
+          半开相交（即存在某一时刻旧占用已达容量、再加入本件即超限）
+          当且仅当 ``t < e`` 且 ``t + travel > s``，整数时刻即
+          ``t ∈ [s - travel + 1, e)``。注意必须按**整个新占用区间**判断，
+          而不是只看进入时刻的并发；
+        - **封闭阻塞**：进入时刻 ``t`` 落在封闭 ``[cs, ce)`` 内，
+          即 ``t ∈ [cs, ce)``（进入后跨过封闭起点允许）。
+
+        两类阻塞区间取并集并合并；合并后按起点严格递增、互不重叠。
+        """
+        travel = self.edge.travel
+        blocked: list[tuple[int, int]] = list(self.edge.closures)
+        for s, e in self.saturated_regions():
+            # travel ≥ 1 且 e > s，故 s - travel + 1 ≤ s < e，区间必非空
+            blocked.append((s - travel + 1, e))
+        return merge_intervals(sorted(blocked))
 
     def earliest_entry(self, ready: int) -> int:
         """展品在 ``ready`` 时刻到达通道起点时，最早可进入时刻。
 
         候选进入时刻 ``t ≥ ready`` 必须同时满足：
 
-        1. **容量**：区间 ``[t, t+travel)`` 内同时在通道内的已编排展品数
-           小于容量。占用按半开区间计数，恰好在 ``t`` 离开的区间不计数；
+        1. **容量**：按**同一时刻的实际并发**计数，加入本件后的
+           ``[t, t+travel)`` 内不存在任一时刻并发超过容量。占用按
+           半开区间计数，恰好在 ``t`` 离开的区间不计数；
         2. **封闭**：``t`` 不落在任何封闭半开区间 ``[cs, ce)`` 内
            （``t == ce`` 可以进入；进入后跨过封闭开始时刻允许）。
 
-        不可行时把 ``t`` 推进到“挡住它的最早约束的下一可行时刻”：
-        容量冲突 → 与之重叠的占用区间中最早的离开时刻；
-        封闭冲突 → 该封闭时段结束时刻。两个候选取较晚者。
-        每次推进都越过至少一个有限右端点，故迭代必然终止。
+        两类约束统一展开为“进入时刻”时间线上的阻塞半开区间集合
+        （见 :meth:`blocked_entry_intervals`）。从 ``ready`` 起线性扫描：
+        若 ``t`` 落在某个阻塞区间内，则把 ``t`` 推进到该区间右端点
+        （右开：右端点本身重新可行），并**继续用推进后的 t 检查之后的
+        全部区间**——容量释放与封闭结束连续交替挡路时逐段越过，
+        不会跳过更早的空档。每次推进都越过至少一个有限右端点，
+        扫描必然终止，终止处即真正的首个可行时刻。
         """
         t = ready
-        travel = self.edge.travel
-        while True:
-            leave = t + travel
-            # 与 [t, t+travel) 半开重叠的已占用区间：
-            # 占用在 t 整点已离开（e == t）不计；下一件在 leave 整点进入
-            # （s == leave）也不计。
-            overlapping = [
-                (s, e) for s, e in self.occupied if s < leave and e > t
-            ]
-            next_t: int | None = None
-            if len(overlapping) >= self.edge.capacity:
-                # 最早一条冲突区间释放之前计数不会下降（其间没有区间结束），
-                # 故至少要等到最早的离开时刻。
-                next_t = min(e for _s, e in overlapping)
-
-            # 封闭检查：进入时刻不得落在 [cs, ce) 内
-            for cs, ce in self.edge.closures:
-                if cs <= t < ce:
-                    if next_t is None or ce > next_t:
-                        next_t = ce
-                    break  # 区间已合并、互不重叠，至多命中一个
-                if cs > t:
-                    break  # 已按起点排序，之后的时段更晚，不可能命中
-
-            if next_t is None:
-                return t
-            t = next_t
+        for bs, be in self.blocked_entry_intervals():
+            if be <= t:
+                continue  # 阻塞区间完全在候选时刻之前
+            if bs > t:
+                break  # 之后的区间起点更晚，t 落在空档中，可行
+            t = be  # t ∈ [bs, be)：被阻塞，推进到右端点后重新检查后续区间
+        return t
 
     def commit(self, enter: int) -> None:
         """把已确定的占用 [enter, enter+travel) 提交到通道状态。"""
         interval = (enter, enter + self.edge.travel)
         self.occupied.append(interval)
         self.occupied.sort()
+        self._saturated = None
 
 
 # ---------- 时变最早到达搜索 ----------
